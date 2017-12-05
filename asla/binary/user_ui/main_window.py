@@ -1,0 +1,189 @@
+from ui_main_window import Ui_MainWindow
+from binary.ml_tools.predict_service import PredictService
+
+# from pygame import mixer
+# from gtts import gTTS
+from PyQt5 import QtGui, QtCore
+from PyQt5.QtWidgets import QApplication
+from PyQt5.QtCore import QUrl
+from PyQt5.QtWebKit import QWebSettings
+from PyQt5.QtWebKitWidgets import QWebView
+from PyQt5.QtWidgets import QMainWindow
+import threading
+import time
+import glob
+import os
+import requests
+import json
+import pickle
+from sklearn.externals import joblib
+
+try:
+    _fromUtf8 = QtCore.QString.fromUtf8
+except AttributeError:
+    def _fromUtf8(s):
+        return s
+
+try:
+    _encoding = QApplication.UnicodeUTF8
+
+    def _translate(context, text, disambig):
+        return QApplication.translate(context, text, disambig, _encoding)
+except AttributeError:
+    def _translate(context, text, disambig):
+        return QApplication.translate(context, text, disambig)
+
+
+class MainWindow(QMainWindow, Ui_MainWindow):
+    """Main bean class for the user binary"""
+    def __init__(self):
+        QMainWindow.__init__(self)
+        self.setupUi(self)
+        self.predLabel.setText("Ola")
+        self.status_ready("Connect Leap and Press Spacebar to start")
+        [self.model_path, self.scaler_path] = self.update_models()
+        self.thread = PredictionThread(self, os.path.abspath(self.model_path), os.path.abspath(self.scaler_path))
+        self.thread.predict_service.user_ges.msg_ready_signal.connect(self.status_ready)
+        self.thread.predict_service.user_ges.calibration.msg_ready_signal.connect(self.cal_train_msg_slot)
+        self.pred_serv_launch = False
+        QWebSettings.globalSettings().setAttribute(QWebSettings.AcceleratedCompositingEnabled, True)
+        QWebSettings.globalSettings().setAttribute(QWebSettings.WebGLEnabled, True)
+        self.applyBtn.clicked.connect(self.applyBtn_clicked)
+
+    def cal_train_msg_slot(self, msg, reps, iter):
+        text = msg + '. repititions = ' + iter +'/' + reps
+        self.statusbar.showMessage(text)
+
+    def status_ready(self, txt):
+        if txt == "Remove hand from view":
+            txt = ""
+        self.statusbar.showMessage(txt)
+
+    def update_models(self):
+        """ checks if the model is stale and updates it from remote
+        returns the filepath for the latest model file"""
+        # model_files = glob.glob("../models/model*pkl")
+        # scaler_files =  glob.glob("../models/scaler*pkl")
+        # try:
+        # model_fname = 'model.pkl'
+        # scaler_fname = 'scaler.pkl'
+        ## time = get time from file name
+        model_files = glob.glob("model*pkl")
+        scaler_files =  glob.glob("scaler*pkl")
+        if model_files.__len__() == 0:
+            time = "20161211-010905"
+        elif max(model_files).__len__() < 10:
+            time = "20161211-010905"
+        else:
+            time = max(model_files)[5:-4]
+
+        model_json = requests.post("https://aslaserver.herokuapp.com/getmodel", {"time":time})
+        if not model_json.content ==  "NO":
+
+            model_json = json.loads(str(model_json.text))
+            time_new = model_json['time']
+
+            model_pkl = pickle.loads(model_json['model'])
+            latest_model =  'model'+time_new+'.pkl'
+            joblib.dump(model_pkl,latest_model)
+
+            scaler_pkl = pickle.loads(model_json['scaler'])
+            latest_scaler = 'scaler'+time_new+'.pkl'
+            joblib.dump(scaler_pkl, latest_scaler )
+            for old_file in model_files:
+                os.remove(old_file)
+            for old_file in scaler_files:
+                os.remove(old_file)
+        else:
+            latest_model = model_files[0]
+            latest_scaler = scaler_files[0]
+
+        return (latest_model, latest_scaler)
+
+    def applyBtn_clicked(self):
+        """ collects data from input fields and sends it to server for authenctication """
+        print("Nice that you clicked Apply. nothing will happen though!")
+
+    def skeleton_view_render(self, handCoords):
+        """ does projections of hand coordinates on 3d space and renders bones on screen
+            :param handCoords: hand coordinates for all fingers and thumbs
+        """
+        asla_unused(handCoords)
+        self.skeletonView.setUrl('file:///../resources/Perlich_Bones.html')
+
+    def doSpacebarpressed(self):
+        """checks if the user has pressed spacebar. toggles recording of gestures"""
+        # connecting pyqt threadsafe
+
+        if self.pred_serv_launch:
+            self.thread.kill_gesture_prediction_service_thread()
+            self.thread.predict_service.user_ges.set_stop_thread_flag(False)
+            self.pred_serv_launch = False
+            self.status_ready("Prediction Stopped. Press Spacebar to continue Prediction")
+        else:
+            self.thread.spawn_gesture_prediction_service_thread()
+            self.pred_serv_launch = True
+
+    def keyPressEvent(self, event):
+        print 'key press detected!'
+        if event.key() == QtCore.Qt.Key_Space:
+            self.doSpacebarpressed()
+        else:
+            pass
+
+    def closeEvent(self, *args, **kwargs):
+        self.thread.kill_gesture_prediction_service_thread()
+
+def asla_unused(a):
+    a
+    return None
+
+
+class PredictionThread():
+    def __init__(self, main_window, model_path, scaler_path):
+        self.thread = None
+        self.stop = True
+        # mixer.init()
+        self.predict_service = PredictService(model_path, scaler_path)
+        self.predict_service.make_gesture_obj()
+        self.predict_service.user_ges.set_stop_thread_flag(False)
+        # self.predict_service.setStatusbar(main_window.statusbar)
+        self.status_bar = main_window.statusbar
+        self.predicted_label = None
+        self.main_window = main_window
+
+
+    def do_predict_label(self):
+        print 'in predict label. mainwindow. thread functioning'
+        while True:
+            if (self.predict_service.capture_gesture()):
+                self.predicted_label = self.predict_service.predict_label()
+                # tts = gTTS(text=str(self.predicted_label), lang='en')
+                # tts.save("prediction.mp3")
+                # mixer.music.load("prediction.mp3")
+                # mixer.music.play()
+                #
+                self.main_window.predLabel.setText(self.predicted_label)
+
+            if self.stop == True:
+                break
+            time.sleep(0.05)
+
+    def spawn_gesture_prediction_service_thread(self):
+        """ spawns a thread and calls on gesture predticiton service every few miliseconds"""
+        self.thread = threading.Thread(target=self.do_predict_label)
+        self.stop = False
+        self.thread.start()
+        self.readMessageThread = threading.Thread(target=self.do_read_msg)
+    def do_read_msg(self):
+        msg = self.predict_service.user_ges.getStatus()
+        self.status_bar.showMessage(msg)
+    def kill_gesture_prediction_service_thread(self):
+        """ kills prediction service and cleans up"""
+        self.stop = True
+        self.thread.join(1)
+        # self.readMessageThread.join(1);
+        while self.thread.isAlive() or self.readMessageThread.isAlive():
+            self.predict_service.user_ges.set_stop_thread_flag(True)
+            print 'why wouldnt you die thread!'
+            self.thread.join(1)
